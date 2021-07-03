@@ -789,6 +789,64 @@ func getResourceID(groupResource schema.GroupResource, namespace, name string) s
 	return fmt.Sprintf("%s/%s/%s", groupResource.String(), namespace, name)
 }
 
+func (ctx *restoreContext) patchServiceAccount(
+	client client.Dynamic,
+	namespace string,
+	name string,
+	restoreObj *unstructured.Unstructured,
+	existingObj *unstructured.Unstructured,
+) (Result, Result) {
+	warnings, errs := Result{}, Result{}
+	desired, err := mergeServiceAccounts(existingObj, restoreObj)
+	if err != nil {
+		ctx.log.Infof("error merging secrets for ServiceAccount %s: %v", kube.NamespaceAndName(restoreObj), err)
+		warnings.Add(namespace, err)
+		return warnings, errs
+	}
+
+	patchBytes, err := generatePatch(existingObj, desired)
+	if err != nil {
+		ctx.log.Infof("error generating patch for ServiceAccount %s: %v", kube.NamespaceAndName(restoreObj), err)
+		warnings.Add(namespace, err)
+		return warnings, errs
+	}
+
+	if patchBytes == nil {
+		// In-cluster and desired state are the same, so move on to
+		// the next item.
+		return warnings, errs
+	}
+
+	_, err = client.Patch(name, patchBytes)
+	if err != nil {
+		warnings.Add(namespace, err)
+	} else {
+		ctx.log.Infof("ServiceAccount %s successfully updated", kube.NamespaceAndName(restoreObj))
+	}
+	return warnings, errs
+}
+
+func (ctx *restoreContext) deleteObject(
+	client client.Dynamic,
+	gvr schema.GroupResource,
+	namespace string,
+	name string,
+) error {
+	timeout := time.Minute * 10
+	curTime := time.Now()
+	if err := client.Delete(name, metav1.DeleteOptions{}); err != nil {
+		return errors.Wrapf(err, "skipping %s.%s: %s due to deletion failure.", namespace, name, gvr.String())
+	}
+	for time.Now().Sub(curTime) > timeout {
+		_, err := client.Get(name, metav1.GetOptions{})
+		if  apierrors.IsResourceExpired(err) || apierrors.IsGone(err) || apierrors.IsNotFound(err) {
+			return nil
+		}
+		time.Sleep(time.Second * 5)
+	}
+	return errors.New("deletion timeout")
+}
+
 func (ctx *restoreContext) restoreItem(obj *unstructured.Unstructured, groupResource schema.GroupResource, namespace string) (Result, Result) {
 	warnings, errs := Result{}, Result{}
 	resourceID := getResourceID(groupResource, namespace, obj.GetName())
@@ -1129,40 +1187,26 @@ func (ctx *restoreContext) restoreItem(obj *unstructured.Unstructured, groupReso
 		if !equality.Semantic.DeepEqual(fromCluster, obj) {
 			switch groupResource {
 			case kuberesource.ServiceAccounts:
-				desired, err := mergeServiceAccounts(fromCluster, obj)
-				if err != nil {
-					ctx.log.Infof("error merging secrets for ServiceAccount %s: %v", kube.NamespaceAndName(obj), err)
-					warnings.Add(namespace, err)
-					return warnings, errs
-				}
-
-				patchBytes, err := generatePatch(fromCluster, desired)
-				if err != nil {
-					ctx.log.Infof("error generating patch for ServiceAccount %s: %v", kube.NamespaceAndName(obj), err)
-					warnings.Add(namespace, err)
-					return warnings, errs
-				}
-
-				if patchBytes == nil {
-					// In-cluster and desired state are the same, so move on to the next item
-					return warnings, errs
-				}
-
-				_, err = resourceClient.Patch(name, patchBytes)
-				if err != nil {
-					warnings.Add(namespace, err)
-				} else {
-					ctx.log.Infof("ServiceAccount %s successfully updated", kube.NamespaceAndName(obj))
-				}
+				return ctx.patchServiceAccount(resourceClient, namespace, name, obj, fromCluster)
 			default:
-				e := errors.Errorf("could not restore, %s. Warning: the in-cluster version is different than the backed-up version.", restoreErr)
-				warnings.Add(namespace, e)
+				if namespace != "" {
+					// namespaced resource
+					if e := ctx.deleteObject(resourceClient, groupResource, namespace, name); e != nil {
+						warnings.Add(namespace, errors.Wrap(e, "skipping due to deletion failure"))
+						return warnings, errs
+					}
+					createdObj, restoreErr = resourceClient.Create(obj)
+				} else {
+					// cluster scoped resource
+					e := errors.Errorf("could not restore, %s. Warning: the in-cluster version is different than the backed-up version.", restoreErr)
+					warnings.Add(namespace, e)
+					return warnings, errs
+				}
 			}
+		} else {
+			// Existing resource is what we have - no need to do anything.
 			return warnings, errs
 		}
-
-		ctx.log.Infof("Restore of %s, %v skipped: it already exists in the cluster and is the same as the backed up version", obj.GroupVersionKind().Kind, name)
-		return warnings, errs
 	}
 
 	// Error was something other than an AlreadyExists

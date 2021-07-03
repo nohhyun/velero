@@ -82,6 +82,10 @@ type Patcher interface {
 	Patch(name string, data []byte) (*unstructured.Unstructured, error)
 }
 
+type Deleter interface {
+	Delete(name string, opts metav1.DeleteOptions) error
+}
+
 // Dynamic contains client methods that Velero needs for backing up and restoring resources.
 type Dynamic interface {
 	Creator
@@ -89,6 +93,7 @@ type Dynamic interface {
 	Watcher
 	Getter
 	Patcher
+	Deleter
 }
 
 // dynamicResourceClient implements Dynamic.
@@ -116,4 +121,8 @@ func (d *dynamicResourceClient) Get(name string, opts metav1.GetOptions) (*unstr
 
 func (d *dynamicResourceClient) Patch(name string, data []byte) (*unstructured.Unstructured, error) {
 	return d.resourceClient.Patch(context.TODO(), name, types.MergePatchType, data, metav1.PatchOptions{})
+}
+
+func (d *dynamicResourceClient) Delete(name string, opts metav1.DeleteOptions) error {
+	return d.resourceClient.Delete(context.TODO(), name, opts)
 }
